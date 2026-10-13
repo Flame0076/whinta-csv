@@ -264,6 +264,12 @@ def handle_unhandled_text(message):
 
 
 def run_bot():
+    # Fix for 409 Conflict Error: Removes any stuck webhooks before starting polling
+    try:
+        bot.remove_webhook()
+    except Exception as e:
+        print(f"Webhook remove error: {e}")
+        
     # Timeout parameters add kiye taaki background thread strong rahe
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
