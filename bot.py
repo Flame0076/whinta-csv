@@ -6,9 +6,8 @@ from flask import Flask
 import threading
 
 # --- ENVIRONMENT VARIABLES ---
-# Ab token aur ID code mein nahi, balki server ke variables se aayenge
-TOKEN = os.environ.get("BOT_TOKEN") 
-OWNER_ID = int(os.environ.get("OWNER_ID", "0")) 
+TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 # -----------------------------
 
 bot = telebot.TeleBot(TOKEN)
@@ -25,16 +24,28 @@ def home():
 def is_auth(message):
     return message.from_user.id in allowed_users
 
+# --- HELPER: CLEAN & FORMAT NUMBER WITH '+' ---
+def format_full_number(raw_text):
+    """
+    Number se extra spaces/symbols hatata hai aur ensure karta hai
+    ki number ke aage hamesha '+' laga ho (e.g., +918090707888).
+    """
+    digits = re.sub(r'\D', '', str(raw_text))
+    if not digits:
+        return None
+    return f"+{digits}"
+
 # --- START COMMAND ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
     text = (
         "Welcome To Text TO CSV BOT\n"
         "Follow The Commands Below To Start\n"
         "/start - To Start The Bot\n"
         "/Txt_To_CSV - Convert TXT File TO CSV\n"
         "/CSV_To_TXT - Convert CSV File To TXT\n"
-        "/reset - Reset Command For Stopping Ongoing Procces\n\n"
+        "/reset - Reset Command For Stopping Ongoing Process\n\n"
         "Created By @Flame9906"
     )
     bot.send_message(message.chat.id, text)
@@ -59,7 +70,7 @@ def add_user(message):
             bot.reply_to(message, "Send command like this: /add_user 123456789")
 
 # ==========================================
-#             TXT TO CSV FLOW
+#               TXT TO CSV FLOW
 # ==========================================
 @bot.message_handler(commands=['Txt_To_CSV'])
 def txt_to_csv_start(message):
@@ -71,84 +82,104 @@ def txt_to_csv_start(message):
     bot.register_next_step_handler(msg, process_txt_file)
 
 def process_txt_file(message):
-    if message.text == '/reset': return reset_command(message)
+    if message.text == '/reset':
+        return reset_command(message)
     if not message.document:
         msg = bot.send_message(message.chat.id, "Please send a valid TXT file.")
         bot.register_next_step_handler(msg, process_txt_file)
         return
-    
+
     try:
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        content = downloaded_file.decode('utf-8')
-        
-        numbers = [re.sub(r'[^\d+]', '', line.strip()) for line in content.split('\n') if re.sub(r'[^\d+]', '', line.strip())]
-        
-        if not numbers:
-            bot.send_message(message.chat.id, "No numbers found in the file.")
-            return
-            
-        user_data[message.chat.id] = {'numbers': numbers}
-        msg = bot.send_message(message.chat.id, f"{len(numbers)} Contact Found In Your File.\n\nSend Me Name For Your Contacts Example Flame 1")
-        bot.register_next_step_handler(msg, process_contact_name)
-    except Exception as e:
-        bot.send_message(message.chat.id, "Error processing file.")
+        content = downloaded_file.decode('utf-8-sig', errors='ignore')
 
-def process_contact_name(message):
-    if message.text == '/reset': return reset_command(message)
-    raw_name = message.text.strip()
-    
-    match = re.match(r'^(.*?)(?:\s+(\d+))?$', raw_name)
-    if match:
-        prefix = match.group(1).strip()
-        start_index = int(match.group(2)) if match.group(2) else 1
-    else:
-        prefix = raw_name
-        start_index = 1
+        numbers = []
+        # Line by line aur agar ek line me comma (,) se multiple numbers hon toh bhi handle karega
+        for line in content.splitlines():
+            for part in line.split(','):
+                formatted_num = format_full_number(part)
+                if formatted_num:
+                    numbers.append(formatted_num)
+
+        if not numbers:
+            bot.send_message(message.chat.id, "No valid numbers found in the file.")
+            return
+
+        user_data[message.chat.id] = {'numbers': numbers}
         
-    user_data[message.chat.id].update({'prefix': prefix, 'index': start_index})
-    
-    # Tag logic removed. Direct asking for CSV filename
-    msg = bot.send_message(message.chat.id, "Send Me Name For Your Saved File (without .csv):")
-    bot.register_next_step_handler(msg, ask_csv_filename)
+        # Bina Contact Name puche seedha File Name mangega
+        msg = bot.send_message(
+            message.chat.id,
+            f"{len(numbers)} Contacts Found In Your File.\n\nSend Me Name For Your Saved File (without .csv):"
+        )
+        bot.register_next_step_handler(msg, ask_csv_filename)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Error processing file: {e}")
 
 def ask_csv_filename(message):
-    if message.text == '/reset': return reset_command(message)
+    if message.text == '/reset':
+        return reset_command(message)
+
+    # Check if session is active (Fix for Render silent fails)
+    if message.chat.id not in user_data:
+        bot.send_message(message.chat.id, "Session expired due to inactivity. Please use /Txt_To_CSV again.")
+        return
+
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "Please send a valid text name for your file (without .csv):")
+        bot.register_next_step_handler(msg, ask_csv_filename)
+        return
+
     file_name = message.text.strip()
     # Remove extension if user accidentally added it
     if file_name.lower().endswith('.csv'):
         file_name = file_name[:-4]
-        
+
+    # Invalid file characters hatana taaki OS file banate waqt kabhi crash na ho
+    file_name = re.sub(r'[\\/*?:"<>|]', '_', file_name).strip()
+    if not file_name:
+        file_name = "contacts"
+
     generate_csv(message.chat.id, file_name=file_name)
 
 def generate_csv(chat_id, file_name):
     data = user_data.get(chat_id)
-    if not data: return
-        
-    numbers = data['numbers']
-    prefix = data['prefix']
-    start_idx = data['index']
-    
-    # Save with user defined file name
+    if not data or 'numbers' not in data:
+        bot.send_message(chat_id, "Process interrupted. Please start again with /Txt_To_CSV")
+        return
+
     filename = f"{file_name}.csv"
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        # First column: first_name, Second column: phone (Tags removed)
-        writer.writerow(['first_name', 'phone'])
-        for i, num in enumerate(numbers):
-            contact_name = f"{prefix} {start_idx + i}"
-            writer.writerow([contact_name, num])
-            
-    with open(filename, 'rb') as f:
-        bot.send_document(chat_id, f, caption="Your CSV File Is Ready")
-        
-    os.remove(filename)
-    if chat_id in user_data:
-        del user_data[chat_id]
+    try:
+        numbers = data['numbers']
+
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Header: first_name, phone
+            writer.writerow(['first_name', 'phone'])
+            for num in numbers:
+                # first_name aur phone dono me +CountryCodeNumber
+                writer.writerow([num, num])
+
+        with open(filename, 'rb') as f:
+            bot.send_document(
+                chat_id,
+                f,
+                caption="Your CSV File Is Ready\n\nTo make another file, please use /Txt_To_CSV again."
+            )
+
+    except Exception as e:
+        bot.send_message(chat_id, f"Failed to generate file: {e}")
+    finally:
+        # Temp file aur memory hamesha clean rakho
+        if os.path.exists(filename):
+            os.remove(filename)
+        if chat_id in user_data:
+            del user_data[chat_id]
 
 
 # ==========================================
-#             CSV TO TXT FLOW
+#               CSV TO TXT FLOW
 # ==========================================
 @bot.message_handler(commands=['CSV_To_TXT'])
 def csv_to_txt_start(message):
@@ -160,74 +191,122 @@ def csv_to_txt_start(message):
     bot.register_next_step_handler(msg, process_csv_file)
 
 def process_csv_file(message):
-    if message.text == '/reset': return reset_command(message)
+    if message.text == '/reset':
+        return reset_command(message)
     if not message.document:
         msg = bot.send_message(message.chat.id, "Please send a valid CSV file.")
         bot.register_next_step_handler(msg, process_csv_file)
         return
-        
+
     try:
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        content = downloaded_file.decode('utf-8')
-        
+        content = downloaded_file.decode('utf-8-sig', errors='ignore')
+
         reader = csv.reader(content.splitlines())
-        next(reader, None) # Skip header
-        
+        next(reader, None)  # Skip header
+
         numbers = []
         for row in reader:
-            # Check for column index 1 because phone is now strictly in the 2nd column
-            if len(row) > 1: 
-                num = re.sub(r'[^\d+]', '', row[1])
-                if num:
-                    numbers.append(num)
-                    
+            if not row:
+                continue
+            # Second column (phone) check karega, agar single column ho toh first column check karega
+            target_col = row[1] if len(row) > 1 else row[0]
+            num = format_full_number(target_col)
+            if num:
+                numbers.append(num)
+
         if not numbers:
             bot.send_message(message.chat.id, "No numbers found in the CSV.")
             return
-            
+
         user_data[message.chat.id] = {'extracted_numbers': numbers}
-        
-        # Ask for the output file name
+
         msg = bot.send_message(message.chat.id, "Send Me Name For Your Saved File (without .txt):")
         bot.register_next_step_handler(msg, ask_txt_filename)
-        
+
     except Exception as e:
-        bot.send_message(message.chat.id, "Error processing CSV.")
+        bot.send_message(message.chat.id, f"Error processing CSV: {e}")
 
 def ask_txt_filename(message):
-    if message.text == '/reset': return reset_command(message)
-    
+    if message.text == '/reset':
+        return reset_command(message)
+
+    if message.chat.id not in user_data:
+        bot.send_message(message.chat.id, "Session expired due to inactivity. Please use /CSV_To_TXT again.")
+        return
+
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "Please send a valid text name for your file (without .txt):")
+        bot.register_next_step_handler(msg, ask_txt_filename)
+        return
+
     file_name = message.text.strip()
     if file_name.lower().endswith('.txt'):
         file_name = file_name[:-4]
-        
+
+    file_name = re.sub(r'[\\/*?:"<>|]', '_', file_name).strip()
+    if not file_name:
+        file_name = "numbers"
+
     generate_txt(message.chat.id, file_name)
 
 def generate_txt(chat_id, file_name):
     data = user_data.get(chat_id)
-    if not data or 'extracted_numbers' not in data: 
+    if not data or 'extracted_numbers' not in data:
+        bot.send_message(chat_id, "Process interrupted. Please start again with /CSV_To_TXT")
         return
-    
-    numbers = data['extracted_numbers']
-    filename = f"{file_name}.txt"
-    
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(numbers))
-        
-    with open(filename, 'rb') as f:
-        bot.send_document(chat_id, f, caption="Your TXT File Is Ready")
-        
-    os.remove(filename)
-    if chat_id in user_data:
-        del user_data[chat_id]
 
+    filename = f"{file_name}.txt"
+    try:
+        numbers = data['extracted_numbers']
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(numbers))
+
+        with open(filename, 'rb') as f:
+            bot.send_document(
+                chat_id,
+                f,
+                caption="Your TXT File Is Ready\n\nTo make another file, please use /CSV_To_TXT again."
+            )
+
+    except Exception as e:
+        bot.send_message(chat_id, f"Failed to generate file: {e}")
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
+        if chat_id in user_data:
+            del user_data[chat_id]
+
+# ==========================================
+#   GLOBAL HANDLERS (Guidance ke liye)
+# ==========================================
+@bot.message_handler(content_types=['document'])
+def handle_unhandled_document(message):
+    if is_auth(message):
+        bot.send_message(
+            message.chat.id,
+            "Please select an option first:\n\n/Txt_To_CSV - Convert TXT File TO CSV\n/CSV_To_TXT - Convert CSV File To TXT"
+        )
+
+@bot.message_handler(func=lambda message: True)
+def handle_unhandled_text(message):
+    if is_auth(message):
+        bot.send_message(
+            message.chat.id,
+            "I didn't understand that. Please use commands to start a process:\n\n/Txt_To_CSV - TXT to CSV\n/CSV_To_TXT - CSV to TXT\n/reset - To reset ongoing process"
+        )
 
 def run_bot():
-    bot.infinity_polling()
+    # Fix for 409 Conflict Error: Removes any stuck webhooks before starting polling
+    try:
+        bot.remove_webhook()
+    except Exception as e:
+        print(f"Webhook remove error: {e}")
+
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 if __name__ == '__main__':
-    # Telegram Bot ko alag se run karega
-    threading.Thread(target=run_bot).start()
-    # Web server ko start karega
+    threading.Thread(target=run_bot, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
